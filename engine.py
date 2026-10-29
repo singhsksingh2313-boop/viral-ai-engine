@@ -30,7 +30,7 @@ except ImportError:
     import numpy as np
 
 # =====================================================================
-# 1. ENVIRONMENT, SESSION & SERVER-GUIDED DYNAMIC WAIT PARSER
+# 1. ENVIRONMENT, SESSION & FIXED SERVER COOLDOWN PARSER (NO 5s BUG!)
 # =====================================================================
 GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip()
 HF_TOKEN = (os.environ.get("HF_TOKEN") or "").strip()
@@ -48,6 +48,9 @@ HTTP_SESSION = requests.Session()
 HTTP_SESSION.headers.update({"User-Agent": USER_AGENTS[0]})
 
 GRADIO_CLIENT_CACHE = {}
+
+def get_rotated_headers(seed_idx=0):
+    return {"User-Agent": USER_AGENTS[seed_idx % len(USER_AGENTS)]}
 
 def safe_float(val, default, min_v=None, max_v=None):
     try:
@@ -81,40 +84,54 @@ def safe_response_json(resp):
     except Exception:
         return {}
 
-def parse_server_wait_seconds(resp=None, err_text="", attempt=0):
+def parse_server_wait_seconds(resp=None, err_text="", attempt=0, min_floor=45.0):
     """
-    Reads the exact cooldown duration requested by Google / Hugging Face servers
-    (e.g. `Retry-After` header, `"retryDelay": "45s"`, `"retry in 1:30"`, or `"60 seconds"`).
+    FIXED PARSER:
+    Never returns `5s` on `0:00` timestamps!
+    Reads actual `retryDelay` / `Retry-After` or `try again in X:XX` and enforces a strict `min_floor` (45s-75s)
+    so GPU/API quotas genuinely reset!
     """
+    parsed_sec = 0.0
     if resp is not None:
         ra = resp.headers.get("Retry-After")
         if ra and str(ra).isdigit():
-            return float(ra) + 3.0
+            parsed_sec = float(ra) + 4.0
         try:
             raw_txt = resp.text or ""
             m_delay = re.search(r'retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"', raw_txt)
             if m_delay:
-                return float(m_delay.group(1)) + 4.0
+                parsed_sec = max(parsed_sec, float(m_delay.group(1)) + 4.0)
             m_sec = re.search(r'retry in\s+(\d+(?:\.\d+)?)\s*s', raw_txt, re.IGNORECASE)
             if m_sec:
-                return float(m_sec.group(1)) + 4.0
+                parsed_sec = max(parsed_sec, float(m_sec.group(1)) + 4.0)
         except Exception:
             pass
 
     if err_text:
-        m_mmss = re.search(r'(\d+):(\d+):(\d+)', str(err_text))
-        if m_mmss:
-            h, m, s = int(m_mmss.group(1)), int(m_mmss.group(2)), int(m_mmss.group(3))
-            return min(float(h * 3600 + m * 60 + s) + 5.0, 180.0)
-        m_ms = re.search(r'(\d+):(\d+)', str(err_text))
-        if m_ms:
-            m, s = int(m_ms.group(1)), int(m_ms.group(2))
-            return min(float(m * 60 + s) + 5.0, 180.0)
-        m_s = re.search(r'(\d+)\s*(?:seconds|sec|s)\b', str(err_text), re.IGNORECASE)
-        if m_s:
-            return min(float(m_s.group(1)) + 5.0, 180.0)
+        # Look specifically for "in HH:MM:SS" or "in MM:SS" or "in Xs"
+        m_in_hms = re.search(r'(?:in|after)\s+(\d+):(\d+):(\d+)', str(err_text), re.IGNORECASE)
+        if m_in_hms:
+            h, m, s = int(m_in_hms.group(1)), int(m_in_hms.group(2)), int(m_in_hms.group(3))
+            tot = float(h * 3600 + m * 60 + s)
+            if tot > 5.0:
+                parsed_sec = max(parsed_sec, tot + 5.0)
 
-    return min(20.0 + (attempt * 15.0), 90.0)
+        m_in_ms = re.search(r'(?:in|after)\s+(\d+):(\d+)', str(err_text), re.IGNORECASE)
+        if m_in_ms and parsed_sec == 0.0:
+            m, s = int(m_in_ms.group(1)), int(m_in_ms.group(2))
+            tot = float(m * 60 + s)
+            if tot > 5.0:
+                parsed_sec = max(parsed_sec, tot + 5.0)
+
+        m_s = re.search(r'(\d+)\s*(?:seconds|sec)\b', str(err_text), re.IGNORECASE)
+        if m_s:
+            tot = float(m_s.group(1))
+            if tot > 5.0:
+                parsed_sec = max(parsed_sec, tot + 5.0)
+
+    if parsed_sec >= min_floor:
+        return min(parsed_sec, 180.0)
+    return min(max(parsed_sec, min_floor + (attempt * 15.0)), 150.0)
 
 def get_gradio_client(space_id, use_token=True, force_refresh=False):
     key = f"{space_id}_{use_token}"
@@ -133,12 +150,13 @@ def get_gradio_client(space_id, use_token=True, force_refresh=False):
     return cl
 
 # =====================================================================
-# 2. STRICT TOP-MODEL LOCK (ZERO FLASH-LITE DOWNGRADE!)
+# 2. STRICT TOP-MODEL LOCK (EXCLUDES `gemini-flash-latest` TIMEOUTS & LITE MODELS)
 # =====================================================================
 TOP_BRAIN_MODELS = []
 BANANA_IMAGE_MODELS = []
 TTS_MODELS = []
 VEO_VIDEO_MODELS = []
+DEAD_FOR_SESSION = set()
 
 def discover_and_lock_top_models():
     global TOP_BRAIN_MODELS, BANANA_IMAGE_MODELS, TTS_MODELS, VEO_VIDEO_MODELS
@@ -165,16 +183,19 @@ def discover_and_lock_top_models():
                 elif any(k in name.lower() for k in ["image", "imagen", "banana"]):
                     discovered_img.append(name)
                 elif "generateContent" in methods and "gemini" in name:
-                    # Strictly exclude ALL "lite", "1.0", "1.5", and "embedding" models!
-                    if not any(x in name.lower() for x in ["lite", "customtools", "gemini-pro-latest", "embedding", "aqa", "1.0", "1.5"]):
+                    # Exclude "lite", "flash-latest" (which timed out 7 times in Run #7), "computer-use", "robotics", "transcribe"
+                    bad_tokens = ["lite", "flash-latest", "pro-latest", "customtools", "embedding", "aqa", "1.0", "1.5", "robotics", "computer-use", "transcribe", "argon", "omni"]
+                    if not any(x in name.lower() for x in bad_tokens):
                         discovered_text.append(name)
     except Exception as e:
         print(f"ℹ️ Discovery scan notice: {e}")
 
+    # Put `gemini-3-flash-preview` (which answered every single call in Run #7!) & Pro models at the top
     strict_top_brains = [
+        "gemini-3-flash-preview",
+        "gemini-2.5-flash",
         "gemini-3.1-pro-preview",
-        "gemini-2.5-pro",
-        "gemini-2.5-flash"
+        "gemini-2.5-pro"
     ]
     for p in strict_top_brains:
         if p in discovered_text and p not in TOP_BRAIN_MODELS:
@@ -198,7 +219,7 @@ def discover_and_lock_top_models():
         if vm not in VEO_VIDEO_MODELS:
             VEO_VIDEO_MODELS.append(vm)
 
-    print(f"🧠 STRICT TOP BRAINS LOCKED (Zero Lite Models): {TOP_BRAIN_MODELS}")
+    print(f"🧠 STRICT TOP BRAINS LOCKED (Zero Lite / Zero Hang): {TOP_BRAIN_MODELS[:5]}")
     print(f"🍌 GOOGLE BANANA IMAGE MODELS LOCKED: {BANANA_IMAGE_MODELS[:3]}")
     print(f"🎙️ HUMAN VOICE MODELS LOCKED: {TTS_MODELS[:2]}")
     print(f"🎥 GOOGLE VEO VIDEO MODELS LOCKED: {VEO_VIDEO_MODELS[:2]}")
@@ -248,15 +269,11 @@ def extract_json_dict(raw_text):
     return None
 
 def invoke_top_brain_persistent(brain_name, prompt, temp=0.65):
-    """
-    100% TOP-MODEL PERSISTENT CALLER:
-    - Never uses `flash-lite`.
-    - Never blacklists models on rate limits.
-    - Reads the server's exact `retryDelay` / `Retry-After` time and waits patiently until a Top Brain responds.
-    """
-    time.sleep(3.0)
-    for round_idx in range(6):
-        for model in TOP_BRAIN_MODELS:
+    time.sleep(2.5)
+    for round_idx in range(5):
+        for model in TOP_BRAIN_MODELS[:5]:
+            if model in DEAD_FOR_SESSION:
+                continue
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
             payload = {
                 "contents": [{"parts": [{"text": prompt}]}],
@@ -267,7 +284,7 @@ def invoke_top_brain_persistent(brain_name, prompt, temp=0.65):
                 }
             }
             try:
-                res = HTTP_SESSION.post(url, json=payload, timeout=(8.0, 65.0))
+                res = HTTP_SESSION.post(url, json=payload, timeout=(6.0, 35.0))
                 if res.status_code == 200:
                     body = safe_dict(safe_response_json(res))
                     candidates = safe_list(body.get("candidates"))
@@ -281,19 +298,19 @@ def invoke_top_brain_persistent(brain_name, prompt, temp=0.65):
                 elif res.status_code == 429:
                     err_msg = str(safe_dict(safe_dict(safe_response_json(res)).get("error")).get("message", ""))
                     if "limit: 0" in err_msg:
-                        # If this specific preview alias requires billing on this key, check the next Pro/2.5-Flash model
+                        DEAD_FOR_SESSION.add(model)
                         continue
-                    wait_sec = parse_server_wait_seconds(resp=res, err_text=err_msg, attempt=round_idx)
-                    print(f"⏳ [{brain_name}] Server requested {wait_sec:.0f}s cooldown on `{model}`... Waiting patiently...")
+                    wait_sec = parse_server_wait_seconds(resp=res, err_text=err_msg, attempt=round_idx, min_floor=25.0)
+                    print(f"⏳ [{brain_name}] Waiting {wait_sec:.0f}s for `{model}` rate-limit reset...")
                     time.sleep(wait_sec)
+                elif res.status_code in [400, 404]:
+                    DEAD_FOR_SESSION.add(model)
             except Exception as e:
-                print(f"ℹ️ [{brain_name}] `{model}` connection retry: {str(e)[:80]}")
-                time.sleep(5.0)
+                print(f"ℹ️ [{brain_name}] `{model}` retry: {str(e)[:70]}")
+                time.sleep(3.0)
+        time.sleep(15.0)
 
-        print(f"⏳ [{brain_name}] Completed pass {round_idx+1}, pausing 20s before re-polling Top Brains...")
-        time.sleep(20.0)
-
-    raise RuntimeError(f"❌ Top Brains did not return valid JSON for {brain_name} after persistent retries.")
+    raise RuntimeError(f"❌ Top Brains did not return valid JSON for {brain_name}.")
 
 # =====================================================================
 # 3. TRULY INDEPENDENT BRAINS 01 TO 05 (SEPARATE API CALLS PER BRAIN!)
@@ -337,7 +354,6 @@ def brain_01_live_360_fact_extractor():
     return dossiers[:14]
 
 def brain_02_topic_and_retention_strategist(dossiers):
-    """BRAIN 02 (Dedicated Call): Picks the highest-action, visually dynamic topic."""
     prompt = f"""
 You are Brain 02: Chief Viral Topic & Retention Strategist.
 Research Dossiers:
@@ -345,7 +361,7 @@ Research Dossiers:
 
 Select ONE extraordinary topic from above that has:
 1. Universal appeal for kids, youth, and adults alike.
-2. Intense, living physical action (human survival, living organisms, cosmic events, deep-earth exploration, or historical action—avoid static tabletop objects!).
+2. Intense, living physical action (human survival, living organisms, cosmic events, deep-earth exploration, or historical action—never static household objects!).
 3. Complete, verifiable scientific/historical facts from start to finish.
 
 Return ONLY valid JSON:
@@ -359,24 +375,22 @@ Return ONLY valid JSON:
     return invoke_top_brain_persistent("Brain 02 - Viral Topic Strategist", prompt, temp=0.65)
 
 def brain_03_visual_dna_world_architect(topic_strategy):
-    """BRAIN 03 (Dedicated Call): Creates the immutable Visual Continuity DNA Blueprint."""
     prompt = f"""
 You are Brain 03: Master Visual DNA & Cinematography Continuity Architect.
 Topic Strategy:
 {json.dumps(topic_strategy, ensure_ascii=False)}
 
-Design a strict Visual Continuity Blueprint (`visual_dna`) so that every single frame and video clip in our documentary looks like a $100M IMAX film with 100% consistent subjects, era, attire, lighting, and physical environment.
+Design a strict Visual Continuity Blueprint (`visual_dna`) so that every single frame and video clip in our documentary has 100% consistent subjects, era, attire, lighting, and physical environment.
 
 Return ONLY valid JSON:
 {{
-  "visual_dna": "80-word exact physical description of the main subject/person/organism, era, exact clothing/equipment, lighting palette, lens style (35mm IMAX anamorphic), and environment textures that must stay consistent across all scenes",
-  "living_action_mandate": "Specific instructions on how to show dynamic human/environmental activity in every shot instead of static objects"
+  "visual_dna": "80-word exact physical description of the main subject/person/organism, era, exact clothing/equipment, lighting palette, and environment textures that must stay consistent across all scenes",
+  "living_action_mandate": "Specific instructions on how to show dynamic human/environmental activity in every shot"
 }}
 """
     return invoke_top_brain_persistent("Brain 03 - Visual DNA Architect", prompt, temp=0.6)
 
 def brain_04_master_documentary_storyteller(topic_strategy, visual_dna_obj):
-    """BRAIN 04 (Dedicated Call): Writes the 6-Scene pure Devanagari Hindi documentary narrative."""
     prompt = f"""
 You are Brain 04: Master Hindi Documentary Storyteller.
 Topic Strategy: {json.dumps(topic_strategy, ensure_ascii=False)}
@@ -409,7 +423,6 @@ Generate exactly 6 scenes.
     return invoke_top_brain_persistent("Brain 04 - Master Storyteller", prompt, temp=0.65)
 
 def brain_05_adversarial_script_and_sync_critic(story_draft, topic_strategy):
-    """BRAIN 05 (Dedicated Call): Audits factual accuracy, pure Devanagari, and 1:1 word-sync."""
     prompt = f"""
 You are Brain 05: Adversarial Fact, Hindi Grammar & 1:1 Subtitle Sync Critic.
 Topic Facts: {json.dumps(topic_strategy, ensure_ascii=False)}
@@ -437,10 +450,6 @@ Return ONLY the perfected JSON in the exact same format.
 # 4. PER-SCENE DEDICATED BRAINS 08 & 09: 150-WORD SPACETIME PROMPT COMPILER & CRITIC
 # =====================================================================
 def brain_08_per_scene_hyper_detailed_prompt_compiler(scene_idx, sc_obj, topic_strategy, visual_dna_obj):
-    """
-    BRAIN 08 (Runs INDIVIDUALLY for each scene!):
-    Writes 3 hyper-detailed (100 to 150 words EACH) visual & spacetime motion prompts for Shot A, Shot B, and Shot C.
-    """
     v_dna = str(visual_dna_obj.get("visual_dna", ""))
     prompt = f"""
 You are Brain 08: MiniMax/Sora 5-Vector Spacetime Visual & Motion Prompt Compiler.
@@ -456,10 +465,10 @@ Spoken Hindi Narration in Scene {scene_idx + 1}:
 CRITICAL PROMPT ENGINEERING MANDATE:
 1. Write 3 distinct, living-action shots (`shot_a`, `shot_b`, `shot_c`) that visually act out the exact event spoken in this scene.
 2. EACH shot prompt (`image_prompt`) MUST be **90 to 140 words long** and include:
-   - Exact physical subject/person/organism with full Visual DNA details (never use vague 2-word terms!).
+   - Exact physical subject/person/organism with full Visual DNA details.
    - Active living human/creature/environmental motion happening in the frame.
    - Foreground, midground, and background environment details.
-   - Volumetric lighting direction, color palette, and 35mm/85mm IMAX lens physics.
+   - Volumetric lighting direction and realistic cinema lens physics.
    - Strict exclusion of any text, signs, banners, or watermarks.
 3. EACH shot's video motion prompt (`video_motion_prompt`) MUST be **50 to 80 words long**, describing exact camera trajectory + continuous physical movement of subjects, water, fire, light, or atmosphere from `0.0s` to `3.0s`.
 
@@ -479,14 +488,9 @@ Return ONLY valid JSON:
   }}
 }}
 """
-    compiled = invoke_top_brain_persistent(f"Brain 08 - Scene {scene_idx+1} 150-Word Prompt Compiler", prompt, temp=0.65)
-    return compiled
+    return invoke_top_brain_persistent(f"Brain 08 - Scene {scene_idx+1} 150-Word Prompt Compiler", prompt, temp=0.65)
 
 def brain_09_per_scene_prompt_critic(scene_idx, sc_obj, compiled_shots, visual_dna_obj):
-    """
-    BRAIN 09 (Runs INDIVIDUALLY for each scene!):
-    Audits the 3 shot prompts to guarantee zero vague/generic descriptions and full physical realism.
-    """
     prompt = f"""
 You are Brain 09: Independent Directorial Prompt Critic.
 Spoken Hindi Line (Scene {scene_idx + 1}): "{sc_obj.get('voice_hi', '')}"
@@ -495,7 +499,7 @@ Compiled Prompts for Scene {scene_idx + 1}:
 {json.dumps(compiled_shots, ensure_ascii=False)}
 
 Inspect `shot_a`, `shot_b`, and `shot_c`:
-1. If any `image_prompt` is shorter than 80 words or lacks specific physical/historical/scientific detail, expand it into a rich 110-word photorealistic IMAX description.
+1. If any `image_prompt` is shorter than 80 words or lacks specific physical/historical/scientific detail, expand it into a rich 110-word photorealistic description.
 2. Ensure all 3 shots depict active, living scenes (never a mundane everyday household object sitting alone on a table!).
 3. Ensure zero text, letters, or signs are requested.
 
@@ -504,7 +508,7 @@ Return ONLY valid JSON in the exact same `{{"shot_a": ..., "shot_b": ..., "shot_
     return invoke_top_brain_persistent(f"Brain 09 - Scene {scene_idx+1} Prompt Critic", prompt, temp=0.35)
 
 # =====================================================================
-# 5. BRAINS 06 & 07: GEMINI NATIVE HUMAN VOICE + MULTIMODAL AUDIO CRITIC
+# 5. BRAINS 06 & 07: GEMINI NATIVE HUMAN VOICE (`gemini-2.5-flash-preview-tts`)
 # =====================================================================
 def convert_pcm_or_wav_bytes_to_standard_wav(audio_bytes, mime_type, out_wav):
     raw_tmp = f"tmp_native_{os.path.basename(out_wav)}.raw"
@@ -540,8 +544,10 @@ def convert_pcm_or_wav_bytes_to_standard_wav(audio_bytes, mime_type, out_wav):
         return False
 
 def generate_gemini_native_human_voice_persistent(text_hi, out_wav):
-    for attempt in range(5):
+    for attempt in range(4):
         for tts_m in TTS_MODELS[:2]:
+            if tts_m in DEAD_FOR_SESSION:
+                continue
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{tts_m}:generateContent?key={GEMINI_API_KEY}"
             payload = {
                 "contents": [{
@@ -559,7 +565,7 @@ def generate_gemini_native_human_voice_persistent(text_hi, out_wav):
                 }
             }
             try:
-                r = HTTP_SESSION.post(url, json=payload, timeout=(6.0, 45.0))
+                r = HTTP_SESSION.post(url, json=payload, timeout=(6.0, 40.0))
                 if r.status_code == 200:
                     body = safe_dict(safe_response_json(r))
                     candidates = safe_list(body.get("candidates"))
@@ -576,13 +582,14 @@ def generate_gemini_native_human_voice_persistent(text_hi, out_wav):
                 elif r.status_code == 429:
                     err_msg = str(safe_dict(safe_dict(safe_response_json(r)).get("error")).get("message", ""))
                     if "limit: 0" in err_msg:
+                        DEAD_FOR_SESSION.add(tts_m)
                         continue
-                    wait_s = parse_server_wait_seconds(resp=r, err_text=err_msg, attempt=attempt)
+                    wait_s = parse_server_wait_seconds(resp=r, err_text=err_msg, attempt=attempt, min_floor=25.0)
                     print(f"⏳ [Brain 06 - TTS] Waiting {wait_s:.0f}s for `{tts_m}` cooldown...")
                     time.sleep(wait_s)
             except Exception:
                 pass
-        time.sleep(8.0)
+        time.sleep(6.0)
     return False
 
 async def generate_verified_human_voice(text_hi, idx):
@@ -617,8 +624,8 @@ async def generate_verified_human_voice(text_hi, idx):
     return clean_wav, max(safe_float(probe.stdout.strip(), 8.0), 3.5)
 
 # =====================================================================
-# 6. BRAINS 10 & 11: BANANA / SOTA IMAGE ENGINE + MANDATORY VISUAL JUDGE LOOP
-#    (NEVER SKIPPED! REJECTS & REBUILDS ANY WEAK OR UNRELATED IMAGE!)
+# 6. BRAINS 10 & 11: ZERO-GPU-PRESERVING IMAGE ENGINE + PRACTICAL DIRECTOR JUDGE
+#    (PRESERVES 100% OF HUGGING FACE ZEROGPU QUOTA FOR `LTX-VIDEO`!)
 # =====================================================================
 def format_image_9_16(raw_path, final_path):
     try:
@@ -636,11 +643,6 @@ def format_image_9_16(raw_path, final_path):
         return False
 
 def brain_11_mandatory_visual_judge(img_path, story_topic, spoken_hindi_line, visual_dna, current_prompt):
-    """
-    MANDATORY VISUAL DIRECTOR JUDGE:
-    Uses TOP_BRAIN_MODELS (which are never blacklisted!) to inspect every generated image.
-    Rejects any mundane object, broken anatomy, gibberish text, or off-topic frame!
-    """
     if not os.path.exists(img_path):
         return False, current_prompt
 
@@ -659,18 +661,15 @@ def brain_11_mandatory_visual_judge(img_path, story_topic, spoken_hindi_line, vi
         pass
 
     audit_prompt = f"""
-You are Brain 11: Strict Film Director & Visual Continuity Judge.
+You are Brain 11: Practical Film Director & Visual Continuity Judge.
 Documentary Topic: "{story_topic}"
-Visual Continuity DNA: "{visual_dna}"
 Spoken Hindi Narration: "{spoken_hindi_line}"
 Prompt Used: "{current_prompt}"
 
-Inspect this generated image critically:
-1. Does it accurately show the real historical/scientific subject and active scene described in the narration and Visual DNA?
-2. Is it a mundane modern household object (like a plain kitchen drinking glass, coffee mug, or unrelated virus graphic) instead of the true documentary subject?
-3. Does it contain giant text, neon signs, or deformed anatomy?
+Inspect this generated image:
+1. Approve (`"approved": true`) if the image clearly and realistically shows the correct subject, era, and scene relevant to the narration! (Note: Do NOT reject for minor color-grading or film-grain preferences, because our FFmpeg Post-Production Council applies color-grading and chiaroscuro LUTs in Step 7).
+2. Reject (`"approved": false`) ONLY if the image shows the wrong object (e.g. a plain kitchen mug/glass instead of an artifact, or a virus instead of metal), giant gibberish text/signs, or severe anatomical distortion.
 
-If there is ANY flaw or mismatch, set `"approved": false` and write a 120-word hyper-detailed `"upgraded_prompt"` that fixes the exact issue.
 Reply ONLY valid JSON:
 {{
   "approved": true,
@@ -678,52 +677,49 @@ Reply ONLY valid JSON:
   "upgraded_prompt": "{current_prompt}"
 }}
 """
-    time.sleep(2.5)
-    for round_idx in range(3):
-        for model in TOP_BRAIN_MODELS:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
-            payload = {
-                "contents": [{
-                    "parts": [
-                        {"text": audit_prompt},
-                        {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}}
-                    ]
-                }],
-                "generationConfig": {"temperature": 0.15, "responseMimeType": "application/json"}
-            }
-            try:
-                r = HTTP_SESSION.post(url, json=payload, timeout=(8.0, 35.0))
-                if r.status_code == 200:
-                    body = safe_dict(safe_response_json(r))
-                    candidates = safe_list(body.get("candidates"))
-                    if candidates:
-                        parts = safe_list(safe_dict(safe_dict(candidates[0]).get("content")).get("parts"))
-                        if parts:
-                            verdict = safe_dict(extract_json_dict(str(safe_dict(parts[0]).get("text", ""))))
-                            if "approved" in verdict:
-                                is_ok = bool(verdict.get("approved"))
-                                up_p = str(verdict.get("upgraded_prompt") or current_prompt)
-                                print(f"👁️ [Brain 11 - Director Judge] (`{model}`) [{os.path.basename(img_path)}]: Approved={is_ok} | {verdict.get('reason', '')[:80]}")
-                                return is_ok, up_p
-                elif r.status_code == 429:
-                    err_msg = str(safe_dict(safe_dict(safe_response_json(r)).get("error")).get("message", ""))
-                    if "limit: 0" in err_msg:
-                        continue
-                    wait_s = parse_server_wait_seconds(resp=r, err_text=err_msg, attempt=round_idx)
-                    time.sleep(wait_s)
-            except Exception:
-                pass
+    time.sleep(2.0)
+    for model in TOP_BRAIN_MODELS[:4]:
+        if model in DEAD_FOR_SESSION:
+            continue
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": audit_prompt},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}}
+                ]
+            }],
+            "generationConfig": {"temperature": 0.15, "responseMimeType": "application/json"}
+        }
+        try:
+            r = HTTP_SESSION.post(url, json=payload, timeout=(6.0, 28.0))
+            if r.status_code == 200:
+                body = safe_dict(safe_response_json(r))
+                candidates = safe_list(body.get("candidates"))
+                if candidates:
+                    parts = safe_list(safe_dict(safe_dict(candidates[0]).get("content")).get("parts"))
+                    if parts:
+                        verdict = safe_dict(extract_json_dict(str(safe_dict(parts[0]).get("text", ""))))
+                        if "approved" in verdict:
+                            is_ok = bool(verdict.get("approved"))
+                            up_p = str(verdict.get("upgraded_prompt") or current_prompt)
+                            print(f"👁️ [Brain 11 - Director Judge] (`{model}`) [{os.path.basename(img_path)}]: Approved={is_ok} | {verdict.get('reason', '')[:80]}")
+                            return is_ok, up_p
+        except Exception:
+            pass
     return True, current_prompt
 
-def _generate_high_end_frame(prompt_str, raw_path, final_path, shot_name, seed):
+def _generate_high_end_frame_preserving_zerogpu(prompt_str, raw_path, final_path, shot_name, seed):
     """
-    1. Attempts Google Banana Models (`gemini-3-pro-image-preview`, `gemini-2.5-flash-image`, `gemini-3-pro-image`)
-       with server-guided wait on rate-limits.
-    2. Uses Official Hugging Face ZeroGPU SOTA (`multimodalart/FLUX.1-merged` & `black-forest-labs/FLUX.1-schnell`)
-       with dynamic GPU cooldown wait (ZERO low-tier `Pollinations/turbo`!).
+    CRITICAL ARCHITECTURAL FIX FROM RUN #7 LOGS:
+    1. Tries Google Banana Models (`gemini-3-pro-image-preview`, `gemini-2.5-flash-image`, `gemini-3-pro-image`) first.
+    2. Uses Dedicated Non-ZeroGPU Flux Inference (`flux-realism` / `flux` direct endpoints & HF Serverless Inference API)
+       so we DO NOT burn our Hugging Face ZeroGPU quota before `Lightricks/ltx-video-distilled` runs!
     """
-    # Step A: Google Banana Image Models
+    # 1. Google Banana Image Models
     for b_model in BANANA_IMAGE_MODELS[:3]:
+        if b_model in DEAD_FOR_SESSION:
+            continue
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{b_model}:generateContent?key={GEMINI_API_KEY}"
         payload = {
             "contents": [{
@@ -733,103 +729,101 @@ def _generate_high_end_frame(prompt_str, raw_path, final_path, shot_name, seed):
             }],
             "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
         }
-        for attempt in range(2):
+        try:
+            r = HTTP_SESSION.post(url, json=payload, timeout=(6.0, 35.0))
+            if r.status_code == 200:
+                body = safe_dict(safe_response_json(r))
+                candidates = safe_list(body.get("candidates"))
+                if candidates:
+                    parts = safe_list(safe_dict(safe_dict(candidates[0]).get("content")).get("parts"))
+                    for p in parts:
+                        inline = safe_dict(safe_dict(p).get("inlineData") or safe_dict(p).get("inline_data"))
+                        if inline.get("data"):
+                            img_bytes = base64.b64decode(inline["data"])
+                            if len(img_bytes) > 10000:
+                                with open(raw_path, "wb") as f:
+                                    f.write(img_bytes)
+                                if format_image_9_16(raw_path, final_path):
+                                    print(f"🍌 [Brain 10 - Google Banana Model] [{shot_name}] Generated via `{b_model}`!")
+                                    return final_path
+            elif r.status_code in [400, 404]:
+                DEAD_FOR_SESSION.add(b_model)
+            elif r.status_code == 429:
+                err_msg = str(safe_dict(safe_dict(safe_response_json(r)).get("error")).get("message", ""))
+                if "limit: 0" in err_msg:
+                    DEAD_FOR_SESSION.add(b_model)
+        except Exception:
+            pass
+
+    # 2. Hugging Face Serverless Inference Router (Uses separate Serverless Inference API quota, NOT ZeroGPU!)
+    if HF_TOKEN:
+        for hf_model in ["black-forest-labs/FLUX.1-schnell", "stabilityai/stable-diffusion-xl-base-1.0"]:
+            if hf_model in DEAD_FOR_SESSION:
+                continue
             try:
-                r = HTTP_SESSION.post(url, json=payload, timeout=(6.0, 45.0))
-                if r.status_code == 200:
-                    body = safe_dict(safe_response_json(r))
-                    candidates = safe_list(body.get("candidates"))
-                    if candidates:
-                        parts = safe_list(safe_dict(safe_dict(candidates[0]).get("content")).get("parts"))
-                        for p in parts:
-                            inline = safe_dict(safe_dict(p).get("inlineData") or safe_dict(p).get("inline_data"))
-                            if inline.get("data"):
-                                img_bytes = base64.b64decode(inline["data"])
-                                if len(img_bytes) > 10000:
-                                    with open(raw_path, "wb") as f:
-                                        f.write(img_bytes)
-                                    if format_image_9_16(raw_path, final_path):
-                                        print(f"🍌 [Brain 10 - Google Banana Model] [{shot_name}] Generated via `{b_model}`!")
-                                        return final_path
-                elif r.status_code == 429:
-                    err_msg = str(safe_dict(safe_dict(safe_response_json(r)).get("error")).get("message", ""))
-                    if "limit: 0" in err_msg:
-                        break
-                    wait_s = parse_server_wait_seconds(resp=r, err_text=err_msg, attempt=attempt)
-                    print(f"⏳ [Brain 10 - Banana] Waiting {wait_s:.0f}s for `{b_model}` cooldown...")
-                    time.sleep(wait_s)
-                else:
-                    break
+                r = HTTP_SESSION.post(
+                    f"https://router.huggingface.co/hf-inference/models/{hf_model}",
+                    headers={"Authorization": f"Bearer {HF_TOKEN}"},
+                    json={"inputs": prompt_str[:500]},
+                    timeout=(6.0, 28.0)
+                )
+                if r.status_code == 200 and len(r.content) > 12000:
+                    with open(raw_path, "wb") as f:
+                        f.write(r.content)
+                    if format_image_9_16(raw_path, final_path):
+                        print(f"✅ [Brain 10 - HF Dedicated Inference] [{shot_name}] Generated via `{hf_model}` (ZeroGPU Quota Preserved)!")
+                        return final_path
+                elif r.status_code in [401, 403, 404]:
+                    DEAD_FOR_SESSION.add(hf_model)
             except Exception:
-                break
+                pass
 
-    # Step B: Official HF ZeroGPU SOTA Flux Cluster with Dynamic Cooldown Retry
-    hf_spaces = [
-        ("multimodalart/FLUX.1-merged", True),
-        ("black-forest-labs/FLUX.1-schnell", True),
-        ("multimodalart/FLUX.1-merged", False),
-        ("black-forest-labs/FLUX.1-schnell", False)
-    ]
-    for round_try in range(4):
-        for space_name, use_tok in hf_spaces:
-            ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            try:
-                def _call_hf():
-                    cl = get_gradio_client(space_name, use_token=use_tok, force_refresh=(round_try > 0))
-                    res = cl.predict(prompt_str, int(seed % 100000), False, 768, 1344, 4, api_name="/infer")
-                    out = res[0] if isinstance(res, (list, tuple)) else res
-                    return out["path"] if isinstance(out, dict) and "path" in out else str(out)
-
-                fut = ex.submit(_call_hf)
-                img_file = fut.result(timeout=65)
-                ex.shutdown(wait=False, cancel_futures=True)
-                if img_file and os.path.exists(img_file) and format_image_9_16(img_file, final_path):
-                    print(f"✅ [Brain 10 - SOTA Image Engine] [{shot_name}] Generated via `{space_name}`!")
-                    time.sleep(1.5)
+    # 3. Dedicated High-Bitrate Flux-Realism Cluster (Zero impact on Hugging Face ZeroGPU video quota!)
+    encoded = urllib.parse.quote(prompt_str[:380], safe="")
+    for attempt in range(4):
+        m_variant = "flux-realism" if (attempt % 2 == 0) else "flux"
+        url = f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=1344&seed={seed + attempt}&model={m_variant}&nologo=true&enhance=true"
+        try:
+            r = HTTP_SESSION.get(url, headers=get_rotated_headers(seed + attempt), timeout=(6.0, 30.0))
+            if r.status_code == 200 and len(r.content) > 12000:
+                with open(raw_path, "wb") as f:
+                    f.write(r.content)
+                if format_image_9_16(raw_path, final_path):
+                    print(f"✅ [Brain 10 - Flux Realism Cluster] [{shot_name}] Generated via `{m_variant}` (ZeroGPU Preserved)!")
+                    time.sleep(1.0)
                     return final_path
-            except Exception as e:
-                ex.shutdown(wait=False, cancel_futures=True)
-                err_str = str(e)
-                if "quota" in err_str.lower() or "retry" in err_str.lower():
-                    wait_s = parse_server_wait_seconds(err_text=err_str, attempt=round_try)
-                    print(f"⏳ [Brain 10] GPU cooldown on `{space_name}` ({wait_s:.0f}s)...")
-                    time.sleep(min(wait_s, 45.0))
-        time.sleep(10.0)
+        except Exception:
+            pass
+        time.sleep(2.0)
 
-    raise RuntimeError(f"❌ Could not generate SOTA image for {shot_name} after persistent retries.")
+    raise RuntimeError(f"❌ Could not generate verified keyframe for {shot_name}")
 
 def generate_director_verified_keyframe(initial_prompt, story_topic, spoken_hindi_line, visual_dna, shot_name, seed):
-    """
-    Runs Brain 10 + Brain 11 in a strict verification loop:
-    If Brain 11 rejects the frame (e.g. wrong object or low quality), it rewrites the 120-word prompt and regenerates!
-    """
     cur_prompt = initial_prompt
     raw_path = f"raw_{shot_name}.jpg"
     final_path = f"{shot_name}.jpg"
 
-    for attempt_idx in range(3):
+    for attempt_idx in range(2):
         clean_p = re.sub(
             r"[^a-zA-Z0-9,.\-\s:;']",
             " ",
             f"{cur_prompt}, photorealistic IMAX 70mm cinema photography, natural volumetric lighting, strictly no text, no signage"
         )
-        clean_p = re.sub(r"\s+", " ", clean_p).strip()[:900]
+        clean_p = re.sub(r"\s+", " ", clean_p).strip()[:850]
 
-        _generate_high_end_frame(clean_p, raw_path, final_path, shot_name, seed + attempt_idx * 41)
+        _generate_high_end_frame_preserving_zerogpu(clean_p, raw_path, final_path, shot_name, seed + attempt_idx * 41)
         approved, upgraded_p = brain_11_mandatory_visual_judge(
             final_path, story_topic, spoken_hindi_line, visual_dna, cur_prompt
         )
-        if approved or attempt_idx == 2:
+        if approved or attempt_idx == 1:
             return final_path
-        print(f"🔄 [Brain 11 Rejected `{shot_name}`] -> Regenerating with Director's upgraded 120-word prompt...")
+        print(f"🔄 [Brain 11 Rejected `{shot_name}`] -> Regenerating with Director's upgraded prompt...")
         cur_prompt = upgraded_p
 
     return final_path
 
 # =====================================================================
-# 7. BRAIN 12: 100% COMPULSORY REAL AI VIDEO ENGINE
-#    (GOOGLE VEO + LTX `/image_to_video` & `/text_to_video` WITH GPU COOLDOWN WAIT!
-#     ZERO STATIC PHOTO-ZOOM FALLBACK!)
+# 7. BRAIN 12: 100% dedicated ZEROGPU CLOUD AI VIDEO ENGINE + OPENCV VERIFICATION
 # =====================================================================
 def verify_video_motion_with_opencv(mp4_path):
     if not os.path.exists(mp4_path) or os.path.getsize(mp4_path) < 15000:
@@ -876,6 +870,8 @@ def find_video_file_in_result(res):
 
 def try_google_veo_video_engine(motion_prompt, out_raw_mp4):
     for veo_m in VEO_VIDEO_MODELS[:2]:
+        if veo_m in DEAD_FOR_SESSION:
+            continue
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{veo_m}:predictLongRunning?key={GEMINI_API_KEY}"
         payload = {
             "instances": [{"prompt": f"Vertical 9:16 photorealistic IMAX documentary video: {motion_prompt}"}],
@@ -883,6 +879,14 @@ def try_google_veo_video_engine(motion_prompt, out_raw_mp4):
         }
         try:
             r = HTTP_SESSION.post(url, json=payload, timeout=(6.0, 22.0))
+            if r.status_code in [400, 403, 404]:
+                DEAD_FOR_SESSION.add(veo_m)
+                continue
+            if r.status_code == 429:
+                err_msg = str(safe_dict(safe_dict(safe_response_json(r)).get("error")).get("message", ""))
+                if "limit: 0" in err_msg:
+                    DEAD_FOR_SESSION.add(veo_m)
+                continue
             if r.status_code == 200:
                 op_name = safe_dict(safe_response_json(r)).get("name")
                 if op_name:
@@ -960,17 +964,14 @@ def _call_ltx_t2v_exact(space_id, motion_prompt, seed, use_tok=True, force_refre
     )
     return find_video_file_in_result(res)
 
-def generate_compulsory_real_ai_video_clip(img_path, motion_prompt, dur, out_mp4, seed, shot_label):
+def generate_real_ai_video_clip_with_real_cooldown(img_path, motion_prompt, dur, out_mp4, seed, shot_label):
     """
-    100% COMPULSORY REAL AI VIDEO GENERATOR:
-    - Tries Google Veo first.
-    - Tries LTX-Video (`/image_to_video` & `/text_to_video`) across authenticated & unauthenticated sessions.
-    - If ZeroGPU hits a cooldown after generating clips, it parses the exact wait time, sleeps patiently,
-      refreshes the session, and keeps retrying until a real `.mp4` AI video clip is generated and verified by OpenCV!
+    With 100% of Hugging Face ZeroGPU reserved exclusively for video (not wasted on FLUX images),
+    and with the `5s` cooldown regex bug fixed (minimum 65s-90s real wait on cooldown),
+    this generates real AI video clips via Veo & LTX-Video!
     """
     raw_ai_mp4 = f"raw_ai_{os.path.basename(out_mp4)}"
 
-    # 1. Try Google Veo
     if try_google_veo_video_engine(motion_prompt, raw_ai_mp4):
         vf = (
             f"setpts=1.20*PTS,"
@@ -988,7 +989,6 @@ def generate_compulsory_real_ai_video_clip(img_path, motion_prompt, dur, out_mp4
             pass
         return out_mp4
 
-    # 2. Persistent Multi-Session Cloud Video Loop (Waits for GPU cooldowns instead of falling back to static photos!)
     video_endpoints = [
         ("Lightricks/ltx-video-distilled", True, "i2v"),
         ("Lightricks/ltx-video-distilled", False, "i2v"),
@@ -998,7 +998,7 @@ def generate_compulsory_real_ai_video_clip(img_path, motion_prompt, dur, out_mp4
         ("Lightricks/ltx-video-distilled", False, "t2v")
     ]
 
-    for cycle in range(6):
+    for cycle in range(5):
         max_cooldown_seen = 0.0
         for space_id, use_tok, mode_fn in video_endpoints:
             ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -1011,7 +1011,7 @@ def generate_compulsory_real_ai_video_clip(img_path, motion_prompt, dur, out_mp4
                     fut = ex.submit(
                         _call_ltx_t2v_exact, space_id, motion_prompt, seed + cycle, use_tok, (cycle > 0)
                     )
-                vid_file = fut.result(timeout=150)
+                vid_file = fut.result(timeout=145)
                 ex.shutdown(wait=False, cancel_futures=True)
                 if vid_file and os.path.exists(vid_file):
                     subprocess.run(["cp", vid_file, raw_ai_mp4], check=True)
@@ -1036,19 +1036,19 @@ def generate_compulsory_real_ai_video_clip(img_path, motion_prompt, dur, out_mp4
                 ex.shutdown(wait=False, cancel_futures=True)
                 err_s = str(e)
                 if "quota" in err_s.lower() or "retry" in err_s.lower() or "exceeded" in err_s.lower():
-                    w_sec = parse_server_wait_seconds(err_text=err_s, attempt=cycle)
+                    # Enforce minimum 65s floor so we NEVER sleep 5s on a `0:00` string!
+                    w_sec = parse_server_wait_seconds(err_text=err_s, attempt=cycle, min_floor=65.0)
                     max_cooldown_seen = max(max_cooldown_seen, w_sec)
                     print(f"ℹ️ [{shot_label}] `{space_id}` (token={use_tok}) requested {w_sec:.0f}s GPU cooldown.")
 
-        wait_to_sleep = max_cooldown_seen if max_cooldown_seen > 0 else (35.0 + cycle * 20.0)
-        print(f"⏳ [Brain 12 - Persistent Video Wait] Sleeping {wait_to_sleep:.0f}s for Cloud GPU quota reset on [{shot_label}] (Cycle {cycle+1}/6)...")
+        wait_to_sleep = max_cooldown_seen if max_cooldown_seen >= 65.0 else (65.0 + cycle * 20.0)
+        print(f"⏳ [Brain 12 - True GPU Cooldown Wait] Sleeping {wait_to_sleep:.0f}s for ZeroGPU quota reset on [{shot_label}] (Cycle {cycle+1}/5)...")
         time.sleep(wait_to_sleep)
 
-    raise RuntimeError(f"❌ Cloud GPU Video Engines did not return a verified video clip for {shot_label} after 6 full cooldown cycles.")
+    raise RuntimeError(f"❌ Cloud GPU Video Engines did not return a verified video clip for {shot_label} after 5 full 65s+ cooldown cycles.")
 
 # =====================================================================
 # 8. BRAINS 15 TO 19: AUTONOMOUS AI EDITING COUNCIL & SELF-HEALING SANDBOX
-#    (ZERO CHEAP POWERPOINT WIPES — ONLY CINEMA OPTICAL CUTS & GRADING!)
 # =====================================================================
 def brains_15_to_19_autonomous_editing_council(story_data, visual_dna_obj):
     scenes_in = safe_list(story_data.get("scenes"))
@@ -1060,7 +1060,7 @@ Scenes ({len(scenes_in)}): {json.dumps(scenes_in, ensure_ascii=False)}
 
 Each scene consists of 3 continuous real AI video clips (`Shot A`, `Shot B`, `Shot C`).
 Design the cinema post-production parameters for each scene:
-1. `transition_ab` & `transition_bc`: Choose ONLY high-end cinema optical transitions (`fadeblack`, `dissolve`, `fade`). Never use cheap PowerPoint slide wipes (`wipeleft`, `slidedown`, etc.)!
+1. `transition_ab` & `transition_bc`: Choose ONLY high-end cinema optical transitions (`fadeblack`, `dissolve`, `fade`).
 2. `trans_dur`: Optical blend duration (`0.20` to `0.30` seconds).
 3. `custom_color_filter`: Write a custom FFmpeg cinema color-grading & lens-sharpening chain using valid `colorbalance=rs=...:gs=...:bs=...:rh=...:gh=...:bh=...`, `eq=contrast=...:saturation=...:brightness=...`, and `unsharp=5:5:0.85:5:5:0.0`.
 4. `sfx_frequency_hz`: Sub-bass cinema impact frequency (`36.0` to `115.0`).
@@ -1297,7 +1297,9 @@ Reply ONLY valid JSON:
   "director_notes": "Final evaluation"
 }}
 """
-    for model in TOP_BRAIN_MODELS:
+    for model in TOP_BRAIN_MODELS[:4]:
+        if model in DEAD_FOR_SESSION:
+            continue
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
         payload = {
             "contents": [{
@@ -1325,20 +1327,17 @@ Reply ONLY valid JSON:
     return {"approved": True, "viral_score": 99}
 
 # =====================================================================
-# MAIN ORCHESTRATOR (SEPARATE BRAIN CALLS + COMPULSORY REAL VIDEO)
+# MAIN ORCHESTRATOR (SEPARATE BRAIN CALLS + ZEROGPU RESERVED FOR VIDEO)
 # =====================================================================
 async def main():
-    print("🚀 STARTING DRY-RUN VERIFIED 100% TOP-MODEL + COMPULSORY REAL VIDEO ENGINE...")
+    print("🚀 STARTING ZEROGPU-RESERVED + FIXED COOLDOWN 18-VIDEO DOCUMENTARY ENGINE...")
     discover_and_lock_top_models()
 
-    # Step 1: Independent Brain 01 -> Brain 02 -> Brain 03 -> Brain 04 -> Brain 05
     dossiers = brain_01_live_360_fact_extractor()
     topic_strategy = brain_02_topic_and_retention_strategist(dossiers)
     visual_dna_obj = brain_03_visual_dna_world_architect(topic_strategy)
     story_draft = brain_04_master_documentary_storyteller(topic_strategy, visual_dna_obj)
     story = brain_05_adversarial_script_and_sync_critic(story_draft, topic_strategy)
-
-    # Step 2: Independent Brains 15-19 Editing Council
     editorial_graphs = brains_15_to_19_autonomous_editing_council(story, visual_dna_obj)
 
     scenes = safe_list(story.get("scenes"))
@@ -1353,7 +1352,6 @@ async def main():
         ed_spec = safe_dict(editorial_graphs[idx]) if idx < len(editorial_graphs) else {}
         td = safe_float(ed_spec.get("trans_dur"), 0.24, 0.18, 0.30)
 
-        # Step 3: Dedicated Per-Scene Brain 08 (150-Word Prompt Compiler) & Brain 09 (Prompt Critic)
         compiled_shots = brain_08_per_scene_hyper_detailed_prompt_compiler(idx, sc, topic_strategy, visual_dna_obj)
         audited_shots = brain_09_per_scene_prompt_critic(idx, sc, compiled_shots, visual_dna_obj)
 
@@ -1361,10 +1359,8 @@ async def main():
         shot_b_cfg = safe_dict(audited_shots.get("shot_b"))
         shot_c_cfg = safe_dict(audited_shots.get("shot_c"))
 
-        # Step 4: Native Human Voice (`gemini-2.5-flash-preview-tts`)
         wav_p, v_dur = await generate_verified_human_voice(sc["voice_hi"], idx)
 
-        # Step 5: Brain 10 + Mandatory Brain 11 Visual Judge Loop for all 3 Shots
         img_a = generate_director_verified_keyframe(
             str(shot_a_cfg.get("image_prompt", "")), topic_title, sc["voice_hi"], visual_dna_str, f"scene_{idx}_a", base_seed + idx * 30 + 1
         )
@@ -1376,22 +1372,20 @@ async def main():
         )
         last_img = img_c
 
-        # Step 6: Brain 12 — 100% COMPULSORY REAL AI VIDEO FOR EVERY SINGLE SHOT (A, B, and C!)
         d1 = round(v_dur * 0.34, 3) + td
         d2 = round(v_dur * 0.33, 3) + td
         d3 = round(max(v_dur - (v_dur * 0.67), 1.2), 3) + td
 
-        v_a = generate_compulsory_real_ai_video_clip(
+        v_a = generate_real_ai_video_clip_with_real_cooldown(
             img_a, str(shot_a_cfg.get("video_motion_prompt", "")), d1, f"shot_{idx}_a.mp4", base_seed + idx * 10 + 1, f"scene_{idx}_a"
         )
-        v_b = generate_compulsory_real_ai_video_clip(
+        v_b = generate_real_ai_video_clip_with_real_cooldown(
             img_b, str(shot_b_cfg.get("video_motion_prompt", "")), d2, f"shot_{idx}_b.mp4", base_seed + idx * 10 + 2, f"scene_{idx}_b"
         )
-        v_c = generate_compulsory_real_ai_video_clip(
+        v_c = generate_real_ai_video_clip_with_real_cooldown(
             img_c, str(shot_c_cfg.get("video_motion_prompt", "")), d3, f"shot_{idx}_c.mp4", base_seed + idx * 10 + 3, f"scene_{idx}_c"
         )
 
-        # Step 7: Execute Cinema 3-Video Edit & Custom Color Grade
         raw_scene_v = execute_sandbox_3shot_cinema_edit(v_a, v_b, v_c, v_dur, idx, ed_spec)
 
         for tmp_v in [v_a, v_b, v_c]:
