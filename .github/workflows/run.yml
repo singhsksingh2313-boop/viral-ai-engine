@@ -2,6 +2,15 @@ name: Project Master Editor - Autonomous Pipeline
 
 on:
   workflow_dispatch:
+    inputs:
+      video_url:
+        description: "Optional: Direct MP4 Video URL (leave blank to use source_input.mp4 or real HD documentary footage)"
+        required: false
+        default: ""
+      hindi_script:
+        description: "Optional: Custom Hindi Narration Script (leave blank to use script_hi.txt)"
+        required: false
+        default: ""
   push:
     branches:
       - main
@@ -35,10 +44,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Execute Master Editor Pipeline (End-to-End Dry Run & Verification)
+      - name: Execute Master Editor V2.1 (Gemini 2.5 Pro Director + Human TTS + Word Sync)
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          INPUT_VIDEO_URL: ${{ github.event.inputs.video_url }}
+          INPUT_HINDI_SCRIPT: ${{ github.event.inputs.hindi_script }}
         run: |
           python engine.py
 
