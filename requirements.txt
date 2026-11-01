@@ -1,5 +1,12 @@
-requests
-edge-tts
-Pillow
-huggingface_hub
-gradio_client
+requests>=2.31.0
+numpy>=1.24.0
+opencv-python-headless>=4.8.0
+Pillow>=10.0.0
+soundfile>=0.12.1
+scenedetect[opencv]>=0.6.4
+av>=11.0.0
+edge-tts>=6.1.12
+faster-whisper>=1.0.0
+google-genai>=0.3.0
+huggingface_hub>=0.23.0
+pytest>=8.0.0
