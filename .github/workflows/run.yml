@@ -1,42 +1,59 @@
-name: Run Viral AI Engine
+name: Project Master Editor - Autonomous Pipeline
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  actions: write
 
 jobs:
   build-video:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
 
-    - name: Install System Dependencies (FFmpeg & Fonts)
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y ffmpeg fonts-dejavu fonts-liberation
+      - name: Install System FFmpeg & Devanagari Fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libsndfile1 fonts-noto-core fonts-lohit-deva
 
-    - name: Install Python Libraries
-      run: |
-        pip install -r requirements.txt
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-    - name: Run 7-Brain AI Engine
-      env:
-        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      run: |
-        python engine.py
+      - name: Execute Master Editor Pipeline (End-to-End Dry Run & Verification)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python engine.py
 
-    - name: Upload Final Video for Download
-      uses: actions/upload-artifact@v4
-      with:
-        name: Viral-Video-Assets
-        path: |
-          final_video.mp4
-          thumbnail.jpg
-          metadata.json
+      - name: Upload Final Documentary Package & Independent QC Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: master-editor-production-package
+          retention-days: 5
+          path: |
+            final_video.mp4
+            thumbnail.jpg
+            metadata.json
+            output/final_video.mp4
+            output/narration.wav
+            output/subtitles.srt
+            output/qc_report.json
+            output/qc_report.md
+            output/manifest.json
